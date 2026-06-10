@@ -1,0 +1,25 @@
+# Packaging metadata for the registry.comfy.org Comfy Registry.
+# Field layout follows https://docs.comfy.org/registry/specifications
+# (and the kijai/ComfyUI-Hunyuan3DWrapper precedent).
+
+[project]
+name = "comfyui-hicache"
+description = "Training-free Hunyuan3D shape-generation acceleration: skip DiT steps and forecast the flow-matching velocity instead (HiCache Hermite / HiCache++ DMD, via hicache-pp). Pairs with kijai/ComfyUI-Hunyuan3DWrapper."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = ["hicache-pp>=1.1.0"]
+classifiers = ["Development Status :: 4 - Beta"]
+
+[project.urls]
+Repository = "https://github.com/Archerkattri/ComfyUI-HiCache"
+BugTracker = "https://github.com/Archerkattri/ComfyUI-HiCache/issues"
+
+[tool.comfy]
+PublisherId = "archerkattri"
+DisplayName = "ComfyUI-HiCache"
+Icon = ""
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+testpaths = ["tests"]
