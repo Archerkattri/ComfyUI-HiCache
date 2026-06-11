@@ -113,7 +113,7 @@ def test_compute_calls_follow_schedule(method, interval, warmup):
     steps = 30
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method=method, interval=interval, warmup_steps=warmup)
+    pipe = hp.apply_hicache(pipe, method=method, interval=interval, warmup_steps=warmup)
 
     pipe(num_inference_steps=steps)
 
@@ -155,7 +155,7 @@ def _run_pair(ref_dit, acc_dit, method, steps=30, interval=4, warmup=2, **kw):
     torch.manual_seed(1)
     _, ref_outputs = MockPipeline(ref_dit)(num_inference_steps=steps)
     pipe = MockPipeline(acc_dit)
-    hp.apply_hicache(pipe, method=method, interval=interval, warmup_steps=warmup, **kw)
+    pipe = hp.apply_hicache(pipe, method=method, interval=interval, warmup_steps=warmup, **kw)
     torch.manual_seed(1)
     _, acc_outputs = pipe(num_inference_steps=steps)
     computes = expected_compute_steps(steps, interval, warmup)
@@ -192,7 +192,7 @@ def test_patch_reproduces_hicache_pp_forecast_bitwise():
     dit_b.load_state_dict(dit_a.state_dict())
 
     pipe = MockPipeline(dit_a)
-    hp.apply_hicache(pipe, method="hermite", interval=interval, warmup_steps=warmup)
+    pipe = hp.apply_hicache(pipe, method="hermite", interval=interval, warmup_steps=warmup)
     torch.manual_seed(1)
     _, acc_outputs = pipe(num_inference_steps=steps)
 
@@ -272,7 +272,7 @@ def test_skipped_outputs_finite_and_better_than_naive_reuse():
 def test_interval_1_or_warmup_dominates_means_no_skips():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="hermite", interval=2, warmup_steps=100)
+    pipe = hp.apply_hicache(pipe, method="hermite", interval=2, warmup_steps=100)
     pipe(num_inference_steps=20)
     assert dit.calls == 20 and pipe.model.skipped_steps == 0
 
@@ -283,7 +283,7 @@ def test_interval_1_or_warmup_dominates_means_no_skips():
 def test_dmd_method_populates_snapshots_and_forecasts():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2, dmd_history=5)
+    pipe = hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2, dmd_history=5)
     pipe(num_inference_steps=40)
     st = pipe.model._state
     assert st["backend"] == "dmd"
@@ -294,7 +294,7 @@ def test_dmd_method_populates_snapshots_and_forecasts():
 def test_hermite_method_keeps_snapshots_empty():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="hermite", interval=4, warmup_steps=2)
+    pipe = hp.apply_hicache(pipe, method="hermite", interval=4, warmup_steps=2)
     pipe(num_inference_steps=40)
     st = pipe.model._state
     assert st["backend"] == "hermite"
@@ -305,7 +305,7 @@ def test_hermite_method_keeps_snapshots_empty():
 def test_auto_method_makes_a_holdout_choice():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="auto", interval=3, warmup_steps=2, dmd_history=8)
+    pipe = hp.apply_hicache(pipe, method="auto", interval=3, warmup_steps=2, dmd_history=8)
     pipe(num_inference_steps=40)
     st = pipe.model._state
     assert st["backend"] == "auto"
@@ -319,7 +319,7 @@ def test_auto_method_makes_a_holdout_choice():
 def test_state_resets_between_sampling_runs():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2)
+    pipe = hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2)
 
     pipe(num_inference_steps=20)
     first_run_calls = dit.calls
@@ -334,7 +334,7 @@ def test_state_resets_between_sampling_runs():
 def test_attribute_and_device_passthrough():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="hermite", interval=4, warmup_steps=2)
+    pipe = hp.apply_hicache(pipe, method="hermite", interval=4, warmup_steps=2)
     # pipelines check hasattr(self.model, 'guidance_embed') and call .to()
     assert pipe.model.guidance_embed is False
     pipe.model.to(torch.float32)
@@ -344,12 +344,67 @@ def test_attribute_and_device_passthrough():
 def test_remove_restores_original_model():
     dit = MockDiT()
     pipe = MockPipeline(dit)
-    hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2)
-    assert pipe.model is not dit
-    hp.remove_hicache(pipe)
-    assert pipe.model is dit
-    hp.remove_hicache(pipe)  # idempotent
-    assert pipe.model is dit
+    patched = hp.apply_hicache(pipe, method="dmd", interval=4, warmup_steps=2)
+    assert patched is not pipe and patched.model is not dit
+    assert pipe.model is dit, "apply must not mutate its input pipeline"
+    restored = hp.remove_hicache(patched)
+    assert restored.model is dit
+    assert patched.model is not dit, "remove must not mutate its input either"
+    assert hp.remove_hicache(pipe) is pipe  # unpatched input passes through
+
+
+def test_apply_does_not_alias_between_configs():
+    """ComfyUI cache-aliasing regression (found in GPU validation): node
+    outputs are cached keyed on node inputs, so a pipeline returned for
+    config A must keep running config A even after the same loader pipeline
+    is later patched with config B. In-place patching broke this: a cached
+    'hermite interval=3' output silently ran 'dmd interval=5'."""
+    torch.manual_seed(0)
+    dit = MockDiT()
+    base = MockPipeline(dit)
+
+    pipe_a = hp.apply_hicache(base, method="hermite", interval=3, warmup_steps=2)
+    pipe_b = hp.apply_hicache(base, method="dmd", interval=5, warmup_steps=2)
+
+    # the loader's pipeline is untouched; each copy owns its config
+    assert base.model is dit
+    assert (pipe_a.model.method, pipe_a.model.interval) == ("hermite", 3)
+    assert (pipe_b.model.method, pipe_b.model.interval) == ("dmd", 5)
+    assert pipe_a.model.inner is dit and pipe_b.model.inner is dit
+
+    # serving the A copy after B was created still runs A's schedule
+    steps = 30
+    pipe_a(num_inference_steps=steps)
+    assert dit.calls == len(expected_compute_steps(steps, 3, 2))
+
+
+def test_apply_on_patched_pipeline_replaces_not_nests():
+    dit = MockDiT()
+    base = MockPipeline(dit)
+    once = hp.apply_hicache(base, method="hermite", interval=3, warmup_steps=2)
+    twice = hp.apply_hicache(once, method="dmd", interval=5, warmup_steps=2)
+    assert twice.model.inner is dit, "patch must replace, never nest"
+    assert (once.model.method, once.model.interval) == ("hermite", 3)
+
+
+def test_single_step_runs_reset_at_equal_timestep():
+    """Run-boundary regression: two back-to-back single-step runs both call
+    the model at t=0. The boundary check must treat the *equal* timestep as
+    a new run and recompute — not serve the previous run's cached anchor."""
+    dit = MockDiT()
+    patch = hp.HiCacheModelPatch(dit, method="hermite", interval=3,
+                                 warmup_steps=1)
+    lmi = torch.randn(2, 8, 4)
+    t0 = torch.zeros(2)
+
+    out1 = patch(lmi, t0, cond=None)            # run 1 (single step)
+    with torch.no_grad():
+        dit.base.add_(1.0)                      # "new image": DiT output changes
+    out2 = patch(lmi, t0, cond=None)            # run 2 (single step, same t)
+
+    assert dit.calls == 2, "second single-step run must recompute, not forecast"
+    assert not torch.allclose(out1, out2), "stale anchor served across runs"
+    assert patch.computed_steps == 1 and patch.skipped_steps == 0  # per-run stats
 
 
 # ---------------------------------------------------------------------------

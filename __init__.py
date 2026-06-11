@@ -18,7 +18,7 @@ except ImportError:  # imported outside ComfyUI (tests / tooling), not as a pack
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 WEB_DIRECTORY = None

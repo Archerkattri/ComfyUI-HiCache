@@ -40,15 +40,30 @@ fit is done on the stacked trajectory rather than the combined one — in
 practice the same dynamics; this is the standard trade-off of a model-level
 patch versus first-class pipeline wiring.
 
-Run-boundary detection: these pipelines sample with monotonically *increasing*
-timesteps (``sigmas = linspace(0, 1, N)``; "we start from 0" in the upstream
-source). A timestep value lower than the previous call's therefore marks a new
-sampling run, and the forecast state is re-initialised. The total step count is
-not knowable from inside the model, so the schedule has no end-of-run
-always-compute window (``end_enhance``) — only the initial warmup window.
+Run-boundary detection: these pipelines sample with *strictly increasing*
+timesteps within a run (``sigmas = linspace(0, 1, N)``; "we start from 0" in
+the upstream source) and call the model exactly once per step. A timestep
+value lower than **or equal to** the previous call's therefore marks a new
+sampling run, and the forecast state is re-initialised (the equality case
+catches back-to-back single-step runs, which both start at t=0 and would
+otherwise be served a stale anchor from the previous run). The total step
+count is not knowable from inside the model, so the schedule has no
+end-of-run always-compute window (``end_enhance``) — only the initial warmup
+window.
+
+Cache safety inside ComfyUI: :func:`apply_hicache` / :func:`remove_hicache`
+never mutate the pipeline they are given — they return a shallow copy whose
+``model`` attribute is replaced (weights are shared, so this costs nothing).
+ComfyUI caches node *outputs* keyed on node *inputs*; an in-place patch lets
+a cached output alias a pipeline that a later run re-patched with different
+settings (GPU-validated failure mode: a cached "hermite interval=3" output
+silently ran "dmd interval=5" after an intervening run re-patched the shared
+object). With copy-on-patch every cached output permanently owns its own
+configuration.
 """
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Dict, Optional
 
@@ -99,8 +114,8 @@ class HiCacheModelPatch(torch.nn.Module):
     submodule, so ``.to()`` / ``.half()`` / state-dict access recurse into it).
     """
 
-    def __init__(self, model: torch.nn.Module, *, method: str = "dmd",
-                 interval: int = 5, warmup_steps: int = 2, max_order: int = 1,
+    def __init__(self, model: torch.nn.Module, *, method: str = "hermite",
+                 interval: int = 3, warmup_steps: int = 2, max_order: int = 1,
                  sigma: float = 0.5, dmd_history: int = 5) -> None:
         validate_config(method, interval, warmup_steps, max_order, sigma, dmd_history)
         super().__init__()
@@ -174,9 +189,12 @@ class HiCacheModelPatch(torch.nn.Module):
     def forward(self, latent_model_input: torch.Tensor, timestep: Any,
                 *args: Any, **kwargs: Any) -> torch.Tensor:
         t_val = self._timestep_value(timestep)
-        # New sampling run: timesteps in these pipelines increase monotonically
-        # (sigma 0 -> 1), so a drop in t means the loop restarted.
-        if self._state is None or self._last_t is None or t_val < self._last_t:
+        # New sampling run: within a run these pipelines call the model once
+        # per step with strictly increasing timesteps (sigma 0 -> 1), so a
+        # non-increasing t means the loop restarted. `<=` (not `<`) so that
+        # back-to-back single-step runs (t=0 then t=0 again) also reset
+        # instead of serving the previous run's anchor.
+        if self._state is None or self._last_t is None or t_val <= self._last_t:
             self.reset()
         self._last_t = t_val
 
@@ -200,36 +218,49 @@ class HiCacheModelPatch(torch.nn.Module):
 # ---------------------------------------------------------------------------
 # apply / remove on a pipeline object
 # ---------------------------------------------------------------------------
-def apply_hicache(pipeline: Any, *, method: str = "dmd", interval: int = 5,
+def apply_hicache(pipeline: Any, *, method: str = "hermite", interval: int = 3,
                   warmup_steps: int = 2, max_order: int = 1, sigma: float = 0.5,
                   dmd_history: int = 5) -> Any:
-    """Patch ``pipeline.model`` with a :class:`HiCacheModelPatch` (idempotent).
+    """Return a shallow copy of ``pipeline`` whose ``model`` is patched.
 
-    If the pipeline is already patched the old patch is removed first, so
-    re-running the node with new parameters reconfigures cleanly.
+    The input pipeline is NOT mutated (ComfyUI caches node outputs keyed on
+    node inputs, so a cached output must own its configuration forever — see
+    the module docstring). Weights are shared between the copy and the
+    original; only the wrapper object and the ``model`` attribute differ.
+    If the given pipeline is already patched, the patch is replaced (never
+    nested), so re-running the node with new parameters reconfigures cleanly.
     """
     if not hasattr(pipeline, "model"):
         raise TypeError(
             "HiCache: pipeline has no `.model` attribute - expected a Hunyuan3D "
             f"shape pipeline, got {type(pipeline).__name__}"
         )
-    remove_hicache(pipeline)
-    patch = HiCacheModelPatch(
-        pipeline.model, method=method, interval=interval, warmup_steps=warmup_steps,
+    inner = pipeline.model
+    if getattr(inner, "_hicache_is_patch", False):
+        inner = inner.inner  # replace, never nest
+    patched = copy.copy(pipeline)
+    patched.model = HiCacheModelPatch(
+        inner, method=method, interval=interval, warmup_steps=warmup_steps,
         max_order=max_order, sigma=sigma, dmd_history=dmd_history,
     )
-    pipeline.model = patch
     logger.info(
-        "[HiCache] patched %s.model: method=%s interval=%d warmup=%d",
+        "[HiCache] patched copy of %s: method=%s interval=%d warmup=%d",
         type(pipeline).__name__, method, interval, warmup_steps,
     )
-    return pipeline
+    return patched
 
 
 def remove_hicache(pipeline: Any) -> Any:
-    """Restore the original DiT on ``pipeline.model`` (no-op if not patched)."""
+    """Return ``pipeline`` with the original DiT on ``.model``.
+
+    If the pipeline is patched, a shallow copy with the patch unwrapped is
+    returned (the input is not mutated); if it is not patched, the pipeline
+    is returned unchanged.
+    """
     model = getattr(pipeline, "model", None)
     if model is not None and getattr(model, "_hicache_is_patch", False):
-        pipeline.model = model.inner
-        logger.info("[HiCache] removed patch from %s.model", type(pipeline).__name__)
+        clean = copy.copy(pipeline)
+        clean.model = model.inner
+        logger.info("[HiCache] removed patch from %s", type(pipeline).__name__)
+        return clean
     return pipeline

@@ -78,23 +78,25 @@ def test_node_function_patches_and_unpatches():
     original = pipe.model
 
     (out,) = node.patch(pipe, method="hermite", interval=4, warmup_steps=2)
-    assert out is pipe
-    assert getattr(pipe.model, "_hicache_is_patch", False)
-    assert pipe.model.inner is original
+    assert out is not pipe, "node must return a copy, not mutate (ComfyUI caching)"
+    assert pipe.model is original, "input pipeline must stay unpatched"
+    assert getattr(out.model, "_hicache_is_patch", False)
+    assert out.model.inner is original
 
     # re-patch with new params replaces (not nests) the patch
-    (out,) = node.patch(pipe, method="dmd", interval=3, warmup_steps=1)
-    assert pipe.model.inner is original
-    assert pipe.model.method == "dmd" and pipe.model.interval == 3
+    (out2,) = node.patch(out, method="dmd", interval=3, warmup_steps=1)
+    assert out2.model.inner is original
+    assert out2.model.method == "dmd" and out2.model.interval == 3
+    assert out.model.method == "hermite", "earlier output keeps its config"
 
     # enable=False restores the original model
-    (out,) = node.patch(pipe, enable=False)
-    assert pipe.model is original
+    (out3,) = node.patch(out2, enable=False)
+    assert out3.model is original
 
-    # interval=1 means "no caching" -> also unpatched
-    node.patch(pipe, interval=4)
-    (out,) = node.patch(pipe, interval=1)
-    assert pipe.model is original
+    # interval=1 means "no caching" -> also unpatched (and an unpatched
+    # input passes through unchanged)
+    (out4,) = node.patch(pipe, interval=1)
+    assert out4 is pipe and out4.model is original
 
 
 def test_node_rejects_bad_pipeline():

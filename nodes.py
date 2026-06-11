@@ -32,18 +32,20 @@ class HiCacheAccelerate:
                     "tooltip": "Hunyuan3D shape pipeline from Hy3DModelLoader "
                                "(kijai/ComfyUI-Hunyuan3DWrapper)."}),
                 "method": (list(METHODS), {
-                    "default": "dmd",
+                    "default": "hermite",
                     "tooltip": "Forecast basis on skipped steps:\n"
-                               "hermite = HiCache (polynomial, arXiv:2508.16984)\n"
-                               "dmd = HiCache++ (exponential / Prony-DMD; degrades "
-                               "most gracefully at large intervals)\n"
+                               "hermite = HiCache (polynomial, arXiv:2508.16984; "
+                               "best measured quality inside ComfyUI)\n"
+                               "dmd = HiCache++ (exponential / Prony-DMD; worth "
+                               "trying at large intervals on the big 2.1 DiT)\n"
                                "auto = holdout-pick the better of the two per "
                                "compute step"}),
                 "interval": ("INT", {
-                    "default": 5, "min": 1, "max": 12, "step": 1,
+                    "default": 3, "min": 1, "max": 12, "step": 1,
                     "tooltip": "Compute one DiT step, then forecast interval-1 "
                                "steps. 1 = caching disabled (every step computed). "
-                               "Measured sweet spots: hermite i3, dmd i4-i5."}),
+                               "Measured sweet spot inside ComfyUI: hermite "
+                               "interval 3."}),
                 "warmup_steps": ("INT", {
                     "default": 2, "min": 0, "max": 100, "step": 1,
                     "tooltip": "Always compute the first N sampling steps before "
@@ -78,7 +80,7 @@ class HiCacheAccelerate:
         "Hermite / HiCache++ DMD, via the hicache-pp library)."
     )
 
-    def patch(self, pipeline, method="dmd", interval=5, warmup_steps=2,
+    def patch(self, pipeline, method="hermite", interval=3, warmup_steps=2,
               enable=True, max_order=1, sigma=0.5, dmd_history=5):
         if not enable or interval <= 1:
             return (remove_hicache(pipeline),)

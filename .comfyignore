@@ -1,0 +1,4 @@
+__pycache__/
+tests/
+REGISTRY-SUBMIT.md
+.comfyignore

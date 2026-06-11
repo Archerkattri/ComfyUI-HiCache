@@ -6,11 +6,13 @@ the [`hicache-pp`](https://pypi.org/project/hicache-pp/) library
 ([HiCache](https://arxiv.org/abs/2508.16984) Hermite-polynomial and HiCache++
 DMD/Prony-exponential forecasters).
 
-> **Status: beta.** The forecasting math, schedule, and patch logic are
-> CPU-unit-tested against the library and against the wiring pattern of the
-> measured adapter repos (see *Validated on* below). End-to-end inside-ComfyUI
-> GPU validation is still pending — until then, treat the node as experimental
-> and A/B your own outputs.
+> **Status: GPU-validated end-to-end inside ComfyUI** (2026-06-11, RTX 5090,
+> real ComfyUI + kijai/ComfyUI-Hunyuan3DWrapper + Hunyuan3D-2mini fp16):
+> the patch engages on schedule, sampling runs 2.7x faster at the recommended
+> `hermite interval=3`, the accelerated mesh stays well above the
+> different-seed noise floor in F-score against the unaccelerated mesh, and
+> repeated runs in one session reset state correctly. Measured details in
+> *Validated on* below.
 
 ## What it does
 
@@ -39,8 +41,8 @@ covers the wrapper's vendored `hy3dgen` (Hunyuan3D 2.0) and `hy3dshape`
 
 | method | basis | when to use |
 |---|---|---|
-| `hermite` | HiCache — dual-scaled physicist's Hermite polynomial ([arXiv:2508.16984](https://arxiv.org/abs/2508.16984)) | conservative intervals (i3) |
-| `dmd` *(default)* | HiCache++ — Dynamic Mode Decomposition / Prony exponential basis | larger intervals (i4–i5); degrades most gracefully |
+| `hermite` *(default)* | HiCache, dual-scaled physicist's Hermite polynomial ([arXiv:2508.16984](https://arxiv.org/abs/2508.16984)) | interval 3; the best-measured setting inside ComfyUI and on both upstream checkpoints |
+| `dmd` | HiCache++, Dynamic Mode Decomposition / Prony exponential basis | larger intervals (4 to 5) on the big 2.1 DiT; on mini it measured below the seed-noise floor inside ComfyUI (see *Validated on*) |
 | `auto` | holdout-selected per compute step: serves DMD only when it demonstrably beats the polynomial on the cached window | when unsure |
 
 ### Inputs
@@ -48,8 +50,8 @@ covers the wrapper's vendored `hy3dgen` (Hunyuan3D 2.0) and `hy3dshape`
 | input | default | meaning |
 |---|---|---|
 | `pipeline` | — | `HY3DMODEL` from `Hy3DModelLoader` |
-| `method` | `dmd` | forecast basis (above) |
-| `interval` | 5 | compute 1 step, forecast `interval-1`. `1` disables caching |
+| `method` | `hermite` | forecast basis (above) |
+| `interval` | 3 | compute 1 step, forecast `interval-1`. `1` disables caching |
 | `warmup_steps` | 2 | always compute the first N steps (floored at 1 — the first step has nothing to forecast from) |
 | `enable` | true | off = unpatch, restore the original DiT |
 | `max_order` | 1 | Hermite / finite-difference order |
@@ -60,7 +62,42 @@ Re-running the node with new parameters re-patches cleanly; `enable=false` (or
 `interval=1`) restores the original model. State resets automatically at each
 new sampling run.
 
-## Measured numbers (from the adapter repos — not yet re-measured inside ComfyUI)
+The node never mutates the pipeline it receives: it returns a shallow copy
+whose `model` attribute is the patch (weights stay shared, so this costs no
+VRAM). This matters because ComfyUI caches node outputs keyed on node inputs;
+an in-place patch lets a cached output alias a pipeline that a later run
+re-patched with different settings. That failure was actually observed during
+GPU validation (a cached `hermite interval=3` output silently ran
+`dmd interval=5`) and is covered by a regression test.
+
+## Measured inside ComfyUI (this node, end-to-end)
+
+Setup: ComfyUI 0.24.0, kijai/ComfyUI-Hunyuan3DWrapper master, Hunyuan3D-2mini
+fp16 single-file checkpoint, RTX 5090, torch 2.12 cu128. Workflow: LoadImage
+(518x518 RGBA crop) -> InvertMask -> Hy3DModelLoader -> HiCacheAccelerate ->
+Hy3DGenerateMesh (30 steps, cfg 5.5) -> Hy3DVAEDecode (octree 384) ->
+Hy3DExportMesh. Quality metric: F-score@0.05 of the accelerated mesh against
+the unaccelerated mesh from the same seed (50k surface samples each, shared
+canonical frame, no alignment needed); as a floor, two unaccelerated runs
+that differ only in seed score 0.751 on the same metric.
+
+| config | DiT steps run | sampling | sampling speedup | F1@0.05 vs baseline |
+|---|---|---:|---:|---:|
+| baseline (`enable=false`) | 30/30 | 1.87 s (16.1 it/s) | 1.00x | 1.000 |
+| `hermite interval=3` | 11/30 | 0.70 s (43.1 it/s) | **2.68x** | **0.825** |
+| `dmd interval=5` | 7/30 | 1.10 s (27.2 it/s) | 1.69x | 0.719 |
+
+Reading: `hermite i3` is comfortably above the 0.751 different-seed floor
+(the accelerated mesh is closer to its baseline than a fresh seed is), at a
+2.7x sampling speedup. `dmd i5` lands at the floor on mini inside ComfyUI;
+its forecast also costs more per skipped step (an SVD), which eats into the
+speedup on a DiT this small. Hence the node defaults are `hermite` / `3`.
+On mini the end-to-end win is modest in absolute terms (about 1.2 s of a
+roughly 9 s run) because VAE decode and marching cubes dominate; the larger
+the shape DiT and the higher the step count, the larger the end-to-end share
+the node saves.
+
+## Measured numbers (from the adapter repos, outside ComfyUI)
 
 The same forecasters, wired into the upstream Hunyuan3D pipelines (outside
 ComfyUI), measured on Toys4K image-to-3D with geometry-preserving A/B
@@ -83,9 +120,12 @@ Source adapter repos (measured, runnable):
 [hunyuan2-plus-plus](https://github.com/Archerkattri/hunyuan2-plus-plus) (2.0 + mini),
 [hunyuan2.1-plus-plus](https://github.com/Archerkattri/hunyuan2.1-plus-plus) (2.1).
 
-These numbers transfer to ComfyUI only insofar as the wrapper's vendored
-pipelines run the same denoise loop (they do, structurally — that is what the
-unit tests pin down), but **no inside-ComfyUI measurement has been done yet**.
+These numbers come from first-class pipeline wiring (the forecast caches the
+CFG-combined velocity); the ComfyUI node is a model-level patch that caches
+the pre-CFG stacked output instead. For Hermite the two are mathematically
+identical. For DMD they are not, and the inside-ComfyUI measurement above
+confirms the difference is real on mini: prefer `hermite` in this node unless
+you re-A/B `dmd` on your own checkpoint.
 
 ## Install
 
@@ -107,7 +147,25 @@ to provide the `HY3DMODEL` pipeline the node accelerates.
 
 What has actually been verified, and how:
 
-* **CPU unit tests (35, in `tests/`)** — run `pytest` in this repo, no ComfyUI
+* **End-to-end GPU validation inside ComfyUI** (2026-06-11, RTX 5090, ComfyUI
+  0.24.0, wrapper master, Hunyuan3D-2mini fp16):
+  * headless ComfyUI boots with the pack installed, zero import errors, and
+    `HiCacheAccelerate` appears in `/object_info`;
+  * the full image-to-mesh workflow executes through the ComfyUI API with the
+    node wired in, and the patch demonstrably engages: with 30 sampling steps
+    the run-boundary log reports `11 computed + 19 skipped` for
+    `hermite interval=3` and `7 computed + 23 skipped` for `dmd interval=5`,
+    exactly the library schedule, with the sampling rates and meshes in the
+    table above;
+  * repeated runs in one server session (the same patched pipeline served
+    from ComfyUI's node-output cache across prompts) each reset the forecast
+    state at the run boundary and produce fresh, seed-dependent meshes;
+  * two bugs were found by this validation and are fixed with regression
+    tests: (1) ComfyUI cache aliasing, fixed by copy-on-patch (see *Inputs*);
+    (2) back-to-back single-step runs both start at t=0, which the old
+    strictly-decreasing run-boundary check missed, so the second run could be
+    served a stale anchor; the boundary check is now non-increasing.
+* **CPU unit tests (38, in `tests/`)**, run `pytest` in this repo, no ComfyUI
   needed:
   * the node pack loads standalone exactly the way ComfyUI loads it
     (`NODE_CLASS_MAPPINGS`, `INPUT_TYPES` schema, zero `comfy` imports);
@@ -117,17 +175,18 @@ What has actually been verified, and how:
     are forecast-filled, and the patch's outputs are **bit-identical** to
     driving `hicache-pp`'s state machine directly (the adapter wiring pattern);
   * DMD forecasts are exact (rel. err < 1e-3) on exponential velocity
-    trajectories — its solution class — once its snapshot window fills, and
-    beat naive last-output reuse by >10× there;
-  * run-boundary reset, re-patch/unpatch, attribute & `.to()` passthrough,
-    and parameter validation.
-* **Adapter-repo GPU measurements** — the identical forecasters and schedule,
+    trajectories (its solution class) once its snapshot window fills, and
+    beat naive last-output reuse by >10x there;
+  * run-boundary reset (including the single-step edge), copy-on-patch
+    non-aliasing, re-patch/unpatch, attribute & `.to()` passthrough, and
+    parameter validation.
+* **Adapter-repo GPU measurements**: the identical forecasters and schedule,
   measured in the upstream (non-ComfyUI) Hunyuan3D pipelines (tables above).
 
-**Not yet validated:** running inside ComfyUI on GPU with the real wrapper and
-real checkpoints (including mini/turbo), and quality A/B of the resulting
-meshes through the full Comfy graph. Until that lands this repo stays 0.x/beta
-and is not submitted to the Comfy Registry.
+**Not yet measured:** the full-size Hunyuan3D 2.0/2.1 checkpoints inside
+ComfyUI (the mechanism is identical and checkpoint-agnostic, and the adapter
+repos measured those checkpoints upstream, but the in-Comfy numbers above are
+mini-only), and the multiview sampler path (`Hy3DGenerateMeshMultiView`).
 
 ### One honest design note
 
@@ -136,9 +195,10 @@ The adapter repos wire the forecast into the pipeline loop and cache the
 a ComfyUI node) caches the *pre-CFG stacked* DiT output instead. For the
 Hermite forecaster the two are mathematically identical (forecast and CFG
 combine are both linear); for DMD the fit runs on the stacked trajectory
-rather than the combined one — same dynamics, but not the literally identical
-computation, which is one more reason the GPU A/B is required before any
-lossless claim is repeated for this node.
+rather than the combined one. The inside-ComfyUI A/B above shows this matters
+in practice: DMD's upstream "lossless at interval 5 on mini" result does NOT
+transfer to the model-level patch, so this README does not claim it. Hermite
+numbers transfer exactly, and that is what the defaults use.
 
 ## License
 
