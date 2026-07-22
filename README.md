@@ -1,5 +1,12 @@
 # ComfyUI-HiCache
 
+<p>
+  <a href="https://github.com/Archerkattri/ComfyUI-HiCache/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Archerkattri/ComfyUI-HiCache?color=1f6feb"></a>
+  <a href="https://registry.comfy.org/publishers/archerkattri/nodes/comfyui-hicache"><img alt="Comfy Registry" src="https://img.shields.io/badge/Comfy%20Registry-comfyui-hicache-4b8bbe"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Archerkattri/ComfyUI-HiCache?color=0d9488"></a>
+</p>
+
+
 **Training-free Hunyuan3D shape-generation acceleration for ComfyUI** — skip DiT
 forwards during flow-matching sampling and forecast the velocity instead, using
 the [`hicache-pp`](https://pypi.org/project/hicache-pp/) library
