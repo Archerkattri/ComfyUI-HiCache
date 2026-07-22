@@ -1,3 +1,5 @@
+<p align="center"><img src="icon.png" alt="ComfyUI-HiCache" width="640"></p>
+
 # ComfyUI-HiCache
 
 <p>
