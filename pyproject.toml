@@ -5,7 +5,8 @@
 [project]
 name = "comfyui-hicache"
 description = "Training-free Hunyuan3D shape-generation acceleration: skip DiT steps and forecast the flow-matching velocity instead (HiCache Hermite / HiCache++ DMD, via hicache-pp). Pairs with kijai/ComfyUI-Hunyuan3DWrapper."
-version = "0.2.1"
+version = "0.2.2"
+keywords = ["comfyui", "diffusion-acceleration", "caching", "training-free", "hunyuan3d", "hicache"]
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = ["hicache-pp>=1.1.0"]
