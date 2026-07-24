@@ -341,6 +341,47 @@ def test_attribute_and_device_passthrough():
     assert pipe.model.inner is dit
 
 
+def test_wrap_none_does_not_crash_on_attr_access():
+    """Regression: lazy / GGUF pipelines may hand the wrapper a not-yet-loaded
+    (None) model. Wrapping None must not raise, and an unknown-attribute lookup
+    must give a clear 'not loaded yet' error, NOT the misleading
+    'HiCacheModelPatch object has no attribute inner'."""
+    patch = hp.HiCacheModelPatch(None, method="hermite", interval=3, warmup_steps=2)
+    assert patch.inner is None
+    with pytest.raises(AttributeError) as ei:
+        _ = patch.guidance_embed          # forwarded lookup on a None inner
+    msg = str(ei.value)
+    assert "not loaded yet" in msg and "guidance_embed" in msg
+    with pytest.raises(RuntimeError):     # a compute step on an unbound patch
+        patch(torch.zeros(2, 8, 4), torch.tensor([0.0, 0.0]), cond=None)
+
+
+def test_bind_inner_materializes_lazy_model():
+    """After the real DiT loads, bind_inner attaches it (as a submodule) and the
+    patch runs/skip-forecasts through the denoise loop."""
+    patch = hp.HiCacheModelPatch(None, method="hermite", interval=3, warmup_steps=2)
+    dit = MockDiT()
+    assert patch.bind_inner(dit) is patch
+    assert patch.inner is dit
+    assert "inner" in patch._modules              # registered submodule
+    assert patch.guidance_embed is False          # passthrough works now
+    steps = 20
+    for t in torch.linspace(0, 1, steps):
+        patch(torch.zeros(2, 8, 4), t.expand(2), cond=None)
+    assert patch.skipped_steps > 0
+    assert dit.calls == patch.computed_steps
+
+
+def test_eager_inner_still_registered_as_submodule():
+    """Eager path unbroken: a real nn.Module inner stays a registered submodule so
+    state_dict / parameters / device moves recurse into it."""
+    dit = MockDiT()
+    patch = hp.HiCacheModelPatch(dit, method="hermite", interval=3)
+    assert patch.inner is dit
+    assert "inner" in patch._modules
+    assert any(k.startswith("inner.") for k in patch.state_dict().keys())
+
+
 def test_remove_restores_original_model():
     dit = MockDiT()
     pipe = MockPipeline(dit)

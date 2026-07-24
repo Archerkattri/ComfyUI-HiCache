@@ -114,12 +114,16 @@ class HiCacheModelPatch(torch.nn.Module):
     submodule, so ``.to()`` / ``.half()`` / state-dict access recurse into it).
     """
 
-    def __init__(self, model: torch.nn.Module, *, method: str = "hermite",
+    def __init__(self, model: Optional[torch.nn.Module], *, method: str = "hermite",
                  interval: int = 3, warmup_steps: int = 2, max_order: int = 1,
                  sigma: float = 0.5, dmd_history: int = 5) -> None:
         validate_config(method, interval, warmup_steps, max_order, sigma, dmd_history)
         super().__init__()
-        self.inner = model
+        # ``model`` may be None: lazy / GGUF pipelines materialize the DiT after
+        # patching. A real nn.Module is registered as a submodule (so
+        # .to()/.state_dict() recurse); a None/lazy placeholder is kept as a plain
+        # attribute so __getattr__ never dead-ends. See _set_inner / bind_inner.
+        self._set_inner(model)
         self._hicache_is_patch = True  # marker for apply/remove
         self.method = method
         self.interval = int(interval)
@@ -134,14 +138,54 @@ class HiCacheModelPatch(torch.nn.Module):
         self.computed_steps = 0
         self.skipped_steps = 0
 
-    # -- attribute passthrough -------------------------------------------------
+    # -- inner storage / attribute passthrough ---------------------------------
+    def _set_inner(self, model: Optional[torch.nn.Module]) -> None:
+        """Store the wrapped model so ``self.inner`` is always resolvable.
+
+        A real ``nn.Module`` is registered in ``_modules`` (so device moves and
+        ``state_dict`` recurse into it). A ``None`` placeholder -- or any
+        non-Module -- is kept as a plain attribute in ``__dict__``. This avoids the
+        bug where ``nn.Module.__setattr__`` routes only real Modules into
+        ``_modules``; a None assigned to ``self.inner`` lands in ``__dict__``, and
+        ``nn.Module.__getattr__`` never searches ``__dict__`` -- so the old
+        ``__getattr__`` fallback raised the misleading
+        ``'HiCacheModelPatch' object has no attribute 'inner'`` for lazy pipelines.
+        """
+        for d in (self.__dict__, self._parameters, self._buffers, self._modules):
+            d.pop("inner", None)
+        if isinstance(model, torch.nn.Module):
+            self._modules["inner"] = model
+        else:
+            object.__setattr__(self, "inner", model)
+
+    def _inner(self) -> Any:
+        """The wrapped model from wherever it lives (submodule or plain attr)."""
+        mod = self.__dict__.get("_modules")
+        if mod is not None and "inner" in mod:
+            return mod["inner"]
+        return self.__dict__.get("inner")
+
+    def bind_inner(self, model: torch.nn.Module) -> "HiCacheModelPatch":
+        """Attach the real DiT to a patch created around a lazy (None) placeholder,
+        registering it as a submodule. Lets lazy / GGUF pipelines that materialize
+        the model after patching still route through the cache."""
+        self._set_inner(model)
+        return self
+
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            # fall through to the wrapped DiT (guidance_embed, config, dtype, ...)
-            inner = super().__getattr__("inner")
-            return getattr(inner, name)
+            pass
+        # fall through to the wrapped DiT (guidance_embed, config, dtype, ...)
+        inner = self._inner()
+        if inner is None:
+            raise AttributeError(
+                f"{type(self).__name__!r} has no attribute {name!r}: the wrapped DiT "
+                f"is not loaded yet (inner is None). Lazy / GGUF pipelines materialize "
+                f"the model inside the sampler; call bind_inner(model) once it exists."
+            )
+        return getattr(inner, name)
 
     # -- state handling ----------------------------------------------------------
     def _fresh_state(self) -> Dict[str, Any]:
@@ -205,7 +249,14 @@ class HiCacheModelPatch(torch.nn.Module):
             self.skipped_steps += 1
             return out
 
-        out = self.inner(latent_model_input, timestep, *args, **kwargs)
+        inner = self._inner()
+        if inner is None:
+            raise RuntimeError(
+                "HiCacheModelPatch: a compute step was reached but the wrapped DiT "
+                "is not loaded (inner is None). For lazy / GGUF pipelines, apply "
+                "HiCache after the model is materialized, or call bind_inner(model)."
+            )
+        out = inner(latent_model_input, timestep, *args, **kwargs)
         anchor = out.detach()
         hicache_update_derivatives(state, anchor)
         if self.method in ("dmd", "auto"):
