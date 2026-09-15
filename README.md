@@ -25,6 +25,11 @@ DMD/Prony-exponential forecasters).
 > *Validated on* below.
 
 ## What it does
+## Architecture at a glance
+
+![ComfyUI-HiCache architecture](docs/flow.svg)
+
+The node wraps the Hunyuan3D flow loop at the DiT boundary: scheduled model evaluations anchor the velocity forecast between them.
 
 One node, `HiCache Accelerate (Hunyuan3D)`, wired between
 [kijai/ComfyUI-Hunyuan3DWrapper](https://github.com/kijai/ComfyUI-Hunyuan3DWrapper)'s
