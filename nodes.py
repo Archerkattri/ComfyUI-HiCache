@@ -66,7 +66,23 @@ class HiCacheAccelerate:
                                "high-order terms bounded."}),
                 "dmd_history": ("INT", {
                     "default": 5, "min": 3, "max": 16, "step": 1,
-                    "tooltip": "DMD snapshot window length (dmd/auto methods)."}),
+                    "tooltip": "Snapshot window length. Minimum effective history: "
+                               "3 for hermite, 4 for dmd, 5 for auto; shorter "
+                               "values are rejected for the selected method."}),
+                "max_horizon": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Maximum forecast distance from a paid anchor. "
+                               "0 follows the selected interval; exceeding the "
+                               "budget falls back to full compute."}),
+                "max_memory_mb": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 262144.0, "step": 1.0,
+                    "tooltip": "Optional current-device memory cap for forecast "
+                               "decisions. 0 disables the cap."}),
+                "audit_budget": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "Maximum explicit paid forward-audit decisions "
+                               "available to an integration; reports are exposed "
+                               "on pipeline.model.budget_manifest."}),
             },
         }
 
@@ -81,7 +97,8 @@ class HiCacheAccelerate:
     )
 
     def patch(self, pipeline, method="hermite", interval=3, warmup_steps=2,
-              enable=True, max_order=1, sigma=0.5, dmd_history=5):
+              enable=True, max_order=1, sigma=0.5, dmd_history=5,
+              max_horizon=0, max_memory_mb=0.0, audit_budget=0):
         if not enable or interval <= 1:
             return (remove_hicache(pipeline),)
         return (apply_hicache(
@@ -92,6 +109,9 @@ class HiCacheAccelerate:
             max_order=max_order,
             sigma=sigma,
             dmd_history=dmd_history,
+            max_horizon=None if max_horizon <= 0 else max_horizon,
+            max_memory_mb=None if max_memory_mb <= 0 else max_memory_mb,
+            audit_budget=audit_budget,
         ),)
 
 

@@ -287,8 +287,13 @@ def test_dmd_method_populates_snapshots_and_forecasts():
     pipe(num_inference_steps=40)
     st = pipe.model._state
     assert st["backend"] == "dmd"
+    assert pipe.model.branch_id == "stacked_pre_cfg"
     assert len(st["dmd_snapshots"]) >= 4, "DMD snapshot window never filled"
     assert pipe.model.skipped_steps > 0
+    assert pipe.model.telemetry["decisions"]["forecast"] == pipe.model.skipped_steps
+    assert pipe.model.telemetry["method_counts"]["hermite"] > 0
+    assert sum(pipe.model.telemetry["fallbacks"].values()) > 0
+    assert pipe.model.telemetry["method_counts"]["dmd"] > 0
 
 
 def test_hermite_method_keeps_snapshots_empty():
@@ -448,6 +453,28 @@ def test_single_step_runs_reset_at_equal_timestep():
     assert patch.computed_steps == 1 and patch.skipped_steps == 0  # per-run stats
 
 
+def test_run_identity_and_detached_telemetry_change_on_equal_timestep_reset():
+    dit = MockDiT()
+    patch = hp.HiCacheModelPatch(dit, method="dmd", interval=4,
+                                 warmup_steps=1, dmd_history=4)
+    lmi = torch.randn(2, 8, 4)
+    t0 = torch.zeros(2)
+
+    patch(lmi, t0, cond=None)
+    first_run_id = patch.run_id
+    assert first_run_id
+    assert patch.branch_id == "stacked_pre_cfg"
+    observed = patch.telemetry
+    assert observed["decisions"]["full"] == 1
+    observed["decisions"]["full"] = 99
+    assert patch.telemetry["decisions"]["full"] == 1
+
+    patch(lmi, t0, cond=None)
+    assert patch.run_id and patch.run_id != first_run_id
+    assert patch.telemetry["decisions"]["full"] == 1
+    assert patch.last_decision == "full"
+
+
 # ---------------------------------------------------------------------------
 # parameter validation
 # ---------------------------------------------------------------------------
@@ -466,6 +493,13 @@ def test_bad_params_rejected(kwargs, match):
     base.update(kwargs)
     with pytest.raises(ValueError, match=match):
         hp.validate_config(**base)
+
+
+@pytest.mark.parametrize("method,history", [("dmd", 3), ("auto", 4)])
+def test_history_floor_matches_stateful_forecaster(method, history):
+    with pytest.raises(ValueError, match="dmd_history"):
+        hp.validate_config(method=method, interval=4, warmup_steps=2,
+                           max_order=1, sigma=0.5, dmd_history=history)
 
 
 def test_apply_requires_model_attribute():

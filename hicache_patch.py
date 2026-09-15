@@ -72,11 +72,16 @@ import torch
 from hicache_pp import (
     hicache_init,
     hicache_decide,
+    hicache_telemetry,
     hicache_update_derivatives,
     hicache_forecast,
     dmd_update_snapshots,
     dmd_forecast_state,
     auto_forecast_state,
+    CacheBudget,
+    CacheBudgetRuntime,
+    RunIdentity,
+    stable_digest,
 )
 
 logger = logging.getLogger("ComfyUI-HiCache")
@@ -101,8 +106,11 @@ def validate_config(method: str, interval: int, warmup_steps: int,
         raise ValueError(f"max_order must be >= 1, got {max_order}")
     if not (0.0 < sigma < 1.0):
         raise ValueError(f"sigma must be in (0, 1), got {sigma}")
-    if dmd_history < 3:
-        raise ValueError(f"dmd_history must be >= 3, got {dmd_history}")
+    min_history = {"hermite": 3, "dmd": 4, "auto": 5}[method]
+    if dmd_history < min_history:
+        raise ValueError(
+            f"dmd_history must be >= {min_history} for {method}, got {dmd_history}"
+        )
 
 
 class HiCacheModelPatch(torch.nn.Module):
@@ -116,12 +124,16 @@ class HiCacheModelPatch(torch.nn.Module):
 
     def __init__(self, model: Optional[torch.nn.Module], *, method: str = "hermite",
                  interval: int = 3, warmup_steps: int = 2, max_order: int = 1,
-                 sigma: float = 0.5, dmd_history: int = 5) -> None:
+                 sigma: float = 0.5, dmd_history: int = 5,
+                 budget: Optional[CacheBudget] = None,
+                 max_horizon: Optional[int] = None,
+                 max_memory_mb: Optional[float] = None,
+                 audit_budget: int = 0) -> None:
         validate_config(method, interval, warmup_steps, max_order, sigma, dmd_history)
         super().__init__()
         # ``model`` may be None: lazy / GGUF pipelines materialize the DiT after
         # patching. A real nn.Module is registered as a submodule (so
-        # .to()/.state_dict() recurse); a None/lazy placeholder is kept as a plain
+        # .to()/.state_dict() recurse); a None/lazy deferred module is kept as a plain
         # attribute so __getattr__ never dead-ends. See _set_inner / bind_inner.
         self._set_inner(model)
         self._hicache_is_patch = True  # marker for apply/remove
@@ -131,19 +143,81 @@ class HiCacheModelPatch(torch.nn.Module):
         self.max_order = int(max_order)
         self.sigma = float(sigma)
         self.dmd_history = int(dmd_history)
+        if budget is None:
+            budget = CacheBudget(
+                backend=method,
+                allowed_stages=("shape",),
+                max_horizon=max(1, interval - 1) if max_horizon is None else max_horizon,
+                quality_preset="adapter-default",
+                max_memory_mb=max_memory_mb,
+                audit_budget=audit_budget,
+                fallback="full",
+            )
+        elif not isinstance(budget, CacheBudget):
+            raise TypeError("budget must be a CacheBudget")
+        self.budget = budget
 
         self._state: Optional[Dict[str, Any]] = None
+        self._last_telemetry: Dict[str, Any] = {}
+        self._last_budget_manifest: Dict[str, Any] = {}
+        self._budget_runtime: Optional[CacheBudgetRuntime] = None
+        self._last_budget_decision: Dict[str, Any] = {}
         self._last_t: Optional[float] = None
+        self.last_decision: Optional[str] = None
         # per-run stats (read by the node / logged at run boundaries)
         self.computed_steps = 0
         self.skipped_steps = 0
+
+    @property
+    def run_id(self) -> Optional[str]:
+        """Identity of the currently active sampling run, if any."""
+        return None if self._state is None else self._state.get("run_id")
+
+    @property
+    def branch_id(self) -> Optional[str]:
+        """Stable identity for this model-level, pre-CFG patch branch."""
+        return None if self._state is None else self._state.get("branch_id")
+
+    @property
+    def telemetry(self) -> Dict[str, Any]:
+        """Detached actual-method/fallback counters for the active run."""
+        if self._state is not None:
+            return hicache_telemetry(self._state)
+        return copy.deepcopy(self._last_telemetry)
+
+    @property
+    def budget_manifest(self) -> Dict[str, Any]:
+        """Portable budget/identity/decision report for the active run."""
+        if self._budget_runtime is not None:
+            return copy.deepcopy(self._budget_runtime.manifest.as_dict())
+        return copy.deepcopy(self._last_budget_manifest)
+
+    @property
+    def budget_decision(self) -> Dict[str, Any]:
+        """The last budget decision without exposing mutable runtime state."""
+        return copy.deepcopy(self._last_budget_decision)
+
+    def save_budget_manifest(self, destination: str) -> None:
+        """Save the latest portable manifest; no tensors or local paths are written."""
+        if self._budget_runtime is not None:
+            self._budget_runtime.manifest.write_json(destination)
+        elif self._last_budget_manifest:
+            import json
+            from pathlib import Path
+
+            Path(destination).write_text(
+                json.dumps(self._last_budget_manifest, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            raise RuntimeError("no budget manifest exists; run the patched model first")
 
     # -- inner storage / attribute passthrough ---------------------------------
     def _set_inner(self, model: Optional[torch.nn.Module]) -> None:
         """Store the wrapped model so ``self.inner`` is always resolvable.
 
         A real ``nn.Module`` is registered in ``_modules`` (so device moves and
-        ``state_dict`` recurse into it). A ``None`` placeholder -- or any
+        ``state_dict`` recurse into it). A ``None`` deferred value -- or any
         non-Module -- is kept as a plain attribute in ``__dict__``. This avoids the
         bug where ``nn.Module.__setattr__`` routes only real Modules into
         ``_modules``; a None assigned to ``self.inner`` lands in ``__dict__``, and
@@ -166,7 +240,7 @@ class HiCacheModelPatch(torch.nn.Module):
         return self.__dict__.get("inner")
 
     def bind_inner(self, model: torch.nn.Module) -> "HiCacheModelPatch":
-        """Attach the real DiT to a patch created around a lazy (None) placeholder,
+        """Attach the real DiT to a patch created around a deferred (None) binding,
         registering it as a submodule. Lets lazy / GGUF pipelines that materialize
         the model after patching still route through the cache."""
         self._set_inner(model)
@@ -190,7 +264,7 @@ class HiCacheModelPatch(torch.nn.Module):
     # -- state handling ----------------------------------------------------------
     def _fresh_state(self) -> Dict[str, Any]:
         # hicache_pp validates interval/order/sigma/backend again here.
-        return hicache_init(
+        state = hicache_init(
             num_steps=_NO_END_WINDOW,
             interval=self.interval,
             max_order=self.max_order,
@@ -202,17 +276,25 @@ class HiCacheModelPatch(torch.nn.Module):
             backend=self.method,
             history=self.dmd_history,
         )
+        state["branch_id"] = "stacked_pre_cfg"
+        return state
 
     def reset(self) -> None:
         """Drop all cached anchors and per-run stats (new sampling run)."""
         if self._state is not None and (self.computed_steps or self.skipped_steps):
+            self._last_telemetry = hicache_telemetry(self._state)
             logger.info(
                 "[HiCache] run finished: %d computed + %d skipped DiT steps "
                 "(method=%s, interval=%d)",
                 self.computed_steps, self.skipped_steps, self.method, self.interval,
             )
+        if self._budget_runtime is not None:
+            self._last_budget_manifest = self._budget_runtime.manifest.as_dict()
         self._state = self._fresh_state()
+        self._budget_runtime = None
+        self._last_budget_decision = {}
         self._last_t = None
+        self.last_decision = None
         self.computed_steps = 0
         self.skipped_steps = 0
 
@@ -222,12 +304,53 @@ class HiCacheModelPatch(torch.nn.Module):
             return float(timestep.reshape(-1)[0].item())
         return float(timestep)
 
-    def _forecast(self, state: Dict[str, Any]) -> torch.Tensor:
-        if self.method == "dmd":
+    def _forecast(self, state: Dict[str, Any], method: Optional[str] = None) -> torch.Tensor:
+        method = self.method if method is None else method
+        if method == "dmd":
             return dmd_forecast_state(state)
-        if self.method == "auto":
+        if method == "auto":
             return auto_forecast_state(state)
         return hicache_forecast(state)
+
+    def _ensure_budget_runtime(
+        self, state: Dict[str, Any], latent_model_input: torch.Tensor
+    ) -> CacheBudgetRuntime:
+        inner = self._inner()
+        shape = tuple(int(value) for value in latent_model_input.shape)
+        dtype = str(latent_model_input.dtype)
+        device = str(latent_model_input.device)
+        identity = RunIdentity(
+            model_id=type(inner).__name__ if inner is not None else "unloaded-model",
+            run_id=str(state["run_id"]),
+            schedule_digest=stable_digest({
+                "interval": self.interval,
+                "warmup_steps": self.warmup_steps,
+                "max_order": self.max_order,
+                "sigma": self.sigma,
+                "dmd_history": self.dmd_history,
+            }),
+            cfg_branch="stacked_pre_cfg",
+            conditioning_id="pre-cfg",
+            stage="shape",
+            token_layout_digest=stable_digest({"shape": shape}),
+            dtype=dtype,
+            device=device,
+            batch_id=stable_digest({"shape": shape, "dtype": dtype, "device": device}),
+        )
+        if self._budget_runtime is None or self._budget_runtime.identity.fingerprint != identity.fingerprint:
+            self._budget_runtime = CacheBudgetRuntime(
+                self.budget,
+                identity,
+                source_digest=stable_digest({"adapter": "ComfyUI-HiCache", "contract": "budget-v1"}),
+                config_digest=self.budget.digest,
+            )
+        return self._budget_runtime
+
+    @staticmethod
+    def _current_memory_mb(tensor: torch.Tensor) -> Optional[float]:
+        if not tensor.is_cuda:
+            return None
+        return float(torch.cuda.memory_allocated(tensor.device)) / (1024.0 * 1024.0)
 
     # -- the patched forward ------------------------------------------------------
     def forward(self, latent_model_input: torch.Tensor, timestep: Any,
@@ -243,8 +366,30 @@ class HiCacheModelPatch(torch.nn.Module):
         self._last_t = t_val
 
         state = self._state
-        if hicache_decide(state) == "forecast":
-            out = self._forecast(state)
+        decision = hicache_decide(state)
+        self.last_decision = decision
+        budget_runtime = self._ensure_budget_runtime(state, latent_model_input)
+        budget_decision = budget_runtime.decide(
+            "shape",
+            horizon=int(state.get("counter", 0)) if decision == "forecast" else 0,
+            method=self.method,
+            supported=self._inner() is not None,
+            memory_mb=self._current_memory_mb(latent_model_input),
+            controller_selected=self.method == "auto",
+        )
+        self._last_budget_decision = budget_decision.as_dict()
+        if budget_decision.mode == "fallback" and budget_decision.method == "full" and decision == "forecast":
+            # The legacy scheduler has already incremented its forecast counter;
+            # repair it so the measured state and budget manifest agree.
+            state["type"] = "full"
+            state["counter"] = 0
+            state["activated_steps"].append(state["step"])
+            telemetry = state["telemetry"]["decisions"]
+            telemetry["forecast"] = max(0, int(telemetry.get("forecast", 0)) - 1)
+            telemetry["full"] = int(telemetry.get("full", 0)) + 1
+            decision = "full"
+        if decision == "forecast" and budget_decision.mode in ("forecast", "fallback"):
+            out = self._forecast(state, budget_decision.method)
             state["step"] += 1
             self.skipped_steps += 1
             return out
@@ -271,7 +416,10 @@ class HiCacheModelPatch(torch.nn.Module):
 # ---------------------------------------------------------------------------
 def apply_hicache(pipeline: Any, *, method: str = "hermite", interval: int = 3,
                   warmup_steps: int = 2, max_order: int = 1, sigma: float = 0.5,
-                  dmd_history: int = 5) -> Any:
+                  dmd_history: int = 5, budget: Optional[CacheBudget] = None,
+                  max_horizon: Optional[int] = None,
+                  max_memory_mb: Optional[float] = None,
+                  audit_budget: int = 0) -> Any:
     """Return a shallow copy of ``pipeline`` whose ``model`` is patched.
 
     The input pipeline is NOT mutated (ComfyUI caches node outputs keyed on
@@ -293,6 +441,8 @@ def apply_hicache(pipeline: Any, *, method: str = "hermite", interval: int = 3,
     patched.model = HiCacheModelPatch(
         inner, method=method, interval=interval, warmup_steps=warmup_steps,
         max_order=max_order, sigma=sigma, dmd_history=dmd_history,
+        budget=budget, max_horizon=max_horizon, max_memory_mb=max_memory_mb,
+        audit_budget=audit_budget,
     )
     logger.info(
         "[HiCache] patched copy of %s: method=%s interval=%d warmup=%d",

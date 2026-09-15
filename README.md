@@ -72,6 +72,26 @@ Re-running the node with new parameters re-patches cleanly; `enable=false` (or
 `interval=1`) restores the original model. State resets automatically at each
 new sampling run.
 
+## First-result acceptance checklist
+
+Use a fixed small input and record the exact ComfyUI, wrapper, checkpoint, node
+commit, method, interval, seed, and torch/CUDA versions. Before treating a run
+as accelerated, verify all of the following:
+
+* **Baseline:** run once with `enable=false` (or `interval=1`) and save the
+  output plus the unaccelerated DiT-forward count.
+* **Accelerated:** run the same input and seed with the node enabled; confirm
+  `pipeline.model.branch_id` is `stacked_pre_cfg`, the `run_id` changes on a
+  retry, and `pipeline.model.telemetry` reports the actual decision and method
+  counters. DMD/auto history below their method-specific floors is rejected;
+  short or non-uniform windows remain visible as Hermite fallback counts.
+* **Lifecycle:** repeat the run, including a one-step `t=0` retry, and confirm
+  the run starts with a fresh full decision rather than a stale forecast.
+* **Comparison:** compare baseline and accelerated outputs and retain the raw
+  per-run counts. GPU timing/quality and a clean-host workflow import are
+  separate gates; this CPU package check does not establish a speed or quality
+  claim.
+
 The node never mutates the pipeline it receives: it returns a shallow copy
 whose `model` attribute is the patch (weights stay shared, so this costs no
 VRAM). This matters because ComfyUI caches node outputs keyed on node inputs;
@@ -213,3 +233,10 @@ numbers transfer exactly, and that is what the defaults use.
 ## License
 
 MIT. Not affiliated with Tencent (Hunyuan3D) or kijai (ComfyUI-Hunyuan3DWrapper).
+
+## Current release status
+
+The current adapter includes the shared HiCache++ budget/identity/manifest
+bridge, timing and fallback accounting. Its CPU contract suite passes 45 tests.
+ComfyUI execution with the real CUDA model workflow was not run in this
+environment, so no image-quality or speedup claim is made.
