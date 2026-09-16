@@ -24,12 +24,13 @@ DMD/Prony-exponential forecasters).
 > repeated runs in one session reset state correctly. Measured details in
 > *Validated on* below.
 
+## Runtime path
+
+![ComfyUI-HiCache runtime path](docs/flow.svg)
+
+Scheduled Hunyuan3D model evaluations anchor the velocity history. Forecasted steps reuse that history, while incompatible schedules and failed forecasts return to the full model and report the fallback.
+
 ## What it does
-## Architecture at a glance
-
-![ComfyUI-HiCache architecture](docs/flow.svg)
-
-The node wraps the Hunyuan3D flow loop at the DiT boundary: scheduled model evaluations anchor the velocity forecast between them.
 
 One node, `HiCache Accelerate (Hunyuan3D)`, wired between
 [kijai/ComfyUI-Hunyuan3DWrapper](https://github.com/kijai/ComfyUI-Hunyuan3DWrapper)'s
