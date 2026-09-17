@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "comfyui-hicache"
 description = "Training-free Hunyuan3D shape-generation acceleration: skip DiT steps and forecast the flow-matching velocity instead (HiCache Hermite / HiCache++ DMD, via hicache-pp). Pairs with kijai/ComfyUI-Hunyuan3DWrapper."
-version = "0.2.3"
+version = "0.2.4"
 keywords = ["comfyui", "diffusion-acceleration", "caching", "training-free", "hunyuan3d", "hicache"]
 license = "MIT"
 license-files = ["LICENSE"]
