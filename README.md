@@ -183,6 +183,10 @@ to provide the `HY3DMODEL` pipeline the node accelerates.
 
 What has actually been verified, and how:
 
+* **CPU node-pack integration smoke**: `pytest -q tests/test_nodes.py` imports the
+  package as ComfyUI does, checks its node mappings and input schema, and verifies
+  patch/unpatch behavior without requiring a ComfyUI installation. Forecast and
+  budget unit tests are not included in this review branch.
 * **End-to-end GPU validation inside ComfyUI** (2026-06-11, RTX 5090, ComfyUI
   0.24.0, wrapper master, Hunyuan3D-2mini fp16):
   * headless ComfyUI boots with the pack installed, zero import errors, and
@@ -196,26 +200,11 @@ What has actually been verified, and how:
   * repeated runs in one server session (the same patched pipeline served
     from ComfyUI's node-output cache across prompts) each reset the forecast
     state at the run boundary and produce fresh, seed-dependent meshes;
-  * two bugs were found by this validation and are fixed with regression
-    tests: (1) ComfyUI cache aliasing, fixed by copy-on-patch (see *Inputs*);
+  * two bugs were found during this validation and fixed: (1) ComfyUI cache
+    aliasing, fixed by copy-on-patch (see *Inputs*);
     (2) back-to-back single-step runs both start at t=0, which the old
     strictly-decreasing run-boundary check missed, so the second run could be
     served a stale anchor; the boundary check is now non-increasing.
-* **CPU unit tests (38, in `tests/`)**, run `pytest` in this repo, no ComfyUI
-  needed:
-  * the node pack loads standalone exactly the way ComfyUI loads it
-    (`NODE_CLASS_MAPPINGS`, `INPUT_TYPES` schema, zero `comfy` imports);
-  * against a mock DiT with the wrapper's exact call signature, driven by a
-    synthetic denoise loop replicating the wrapper's flow-matching loop:
-    DiT forwards happen **only** on the scheduled compute steps, skipped steps
-    are forecast-filled, and the patch's outputs are **bit-identical** to
-    driving `hicache-pp`'s state machine directly (the adapter wiring pattern);
-  * DMD forecasts are exact (rel. err < 1e-3) on exponential velocity
-    trajectories (its solution class) once its snapshot window fills, and
-    beat naive last-output reuse by >10x there;
-  * run-boundary reset (including the single-step edge), copy-on-patch
-    non-aliasing, re-patch/unpatch, attribute & `.to()` passthrough, and
-    parameter validation.
 * **Adapter-repo GPU measurements**: the identical forecasters and schedule,
   measured in the upstream (non-ComfyUI) Hunyuan3D pipelines (tables above).
 

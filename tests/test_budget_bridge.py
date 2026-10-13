@@ -42,4 +42,3 @@ def test_budget_cap_forces_full_fallback_and_manifest_counts_actual_decisions():
     assert report["counts"]["fallback"] > 0
     assert report["counts"]["full"] + report["counts"]["forecast"] + report["counts"]["fallback"] == 10
     assert all("path" not in event for event in report["events"])
-
