@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
   <title id="title">ComfyUI-HiCache runtime path</title>
   <desc id="desc">One wrapper, explicit compute/forecast decisions, full-model fallback, and per-run telemetry.</desc>
   <rect width="1200" height="440" rx="22" fill="#020617"/>
