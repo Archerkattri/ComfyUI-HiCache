@@ -3,13 +3,13 @@
 One node, no ComfyUI-internal imports: the patch operates directly on the
 pipeline object that kijai/ComfyUI-Hunyuan3DWrapper passes between nodes as
 the custom ``HY3DMODEL`` type, so this file imports cleanly outside ComfyUI
-too (which is how the unit tests run it).
+too, so package metadata and nodes can be inspected without ComfyUI installed.
 """
 from __future__ import annotations
 
 try:
     from .hicache_patch import METHODS, apply_hicache, remove_hicache
-except ImportError:  # imported outside ComfyUI (tests / tooling), not as a package
+except ImportError:  # imported outside ComfyUI by standalone tooling
     from hicache_patch import METHODS, apply_hicache, remove_hicache
 
 
