@@ -31,7 +31,35 @@ jobs:
         run: python -m compileall -q .
       - name: Run registry security style checks
         run: python -m ruff check --select E702 .
-      - name: Verify ComfyUI node-pack registration and schema
-        run: python -m pytest -q tests/test_nodes.py
+      - name: Smoke-test ComfyUI node-pack registration and schema
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          pack_dir = Path.cwd()
+          spec = importlib.util.spec_from_file_location(
+              "comfyui_hicache_smoke",
+              pack_dir / "__init__.py",
+              submodule_search_locations=[str(pack_dir)],
+          )
+          if spec is None or spec.loader is None:
+              raise RuntimeError("could not load the node pack")
+          pack = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = pack
+          spec.loader.exec_module(pack)
+
+          assert "HiCacheAccelerate" in pack.NODE_CLASS_MAPPINGS
+          assert "HiCacheAccelerate" in pack.NODE_DISPLAY_NAME_MAPPINGS
+          node = pack.NODE_CLASS_MAPPINGS["HiCacheAccelerate"]
+          schema = node.INPUT_TYPES()
+          required = schema["required"]
+          assert required["pipeline"][0] == "HY3DMODEL"
+          assert set(required["method"][0]) == {"hermite", "dmd", "auto"}
+          assert node.RETURN_TYPES == ("HY3DMODEL",)
+          PY
+      - name: Run budget-bridge integration check
+        run: python -m pytest -q tests/test_budget_bridge.py
       - name: Build wheel from clean metadata
         run: python -m pip wheel . --no-deps --wheel-dir dist
